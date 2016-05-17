@@ -18,4 +18,11 @@ end
 Rails.application.config.to_prepare do
   require_dependency 'redmine_idd/hooks'
   ApplicationHelper.send(:include, RedmineIdd::ApplicationHelperPatch )
+  QueriesHelper.send(:include, RedmineIdd::QueriesHelperPatch )
+  Project.send(:include, RedmineIdd::ProjectPatch )
+  Version.send(:include, RedmineIdd::VersionPatch )
+  Redmine::Helpers::Calendar.send(:include, RedmineIdd::CalendarPatch )
+  Redmine::Helpers::Gantt.send(:include, RedmineIdd::GanttPatch )
+  Redmine::I18n.send(:include, RedmineIdd::I18nPatch )
+  Redmine::Utils::DateCalculation.send(:include, RedmineIdd::DateCalculationPatch )
 end

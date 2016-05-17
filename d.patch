@@ -1,0 +1,478 @@
+diff --git a/app/controllers/issues_controller.rb b/app/controllers/issues_controller.rb
+index c23c1b5..7e56af5 100644
+--- a/app/controllers/issues_controller.rb
++++ b/app/controllers/issues_controller.rb
+@@ -425,7 +425,7 @@ class IssuesController < ApplicationController
+       @issue.project ||= @issue.allowed_target_projects.first
+     end
+     @issue.author ||= User.current
+-    @issue.start_date ||= Date.today if Setting.default_issue_start_date_to_creation_date?
++    @issue.start_date ||= DateTime.now if Setting.default_issue_start_date_to_creation_date?
+ 
+     attrs = (params[:issue] || {}).deep_dup
+     if action_name == 'new' && params[:was_default_status] == attrs[:status_id]
+diff --git a/app/helpers/application_helper.rb b/app/helpers/application_helper.rb
+index 6893174..147cfe8 100644
+--- a/app/helpers/application_helper.rb
++++ b/app/helpers/application_helper.rb
+@@ -345,6 +345,42 @@ module ApplicationHelper
+     end
+   end
+ 
++  def time_select_tag( name, stime, options = {} )
++    time = stime.to_time(:utc)
++    if time.nil?
++      selected = {:hour => '', :min => ''}
++    else
++      zone = User.current.time_zone
++      time = zone ? time.in_time_zone(zone) : (time.utc? ? time.localtime : time)
++      selected = {:hour => time.hour, :min => time.min}
++    end
++
++    out = ''
++
++    if options[:required]
++      hours = []
++      mins = []
++    else
++      hours = [['', '']]
++      mins = [['', '']]
++    end
++
++    hours += (0..23).map{|i| ['%02d' % i, i] } # Zero pad
++    out << select_tag(
++      "#{name}[hour]",
++      options_for_select( hours, selected[:hour] ),
++      :style => 'min-width: 10px;max-width: 50px;'
++    )
++
++    out << ':'
++    mins += (0..59).map{|i| ['%02d' % i, i] } # Zero pad
++    out << select_tag(
++      "#{name}[minute]",
++      options_for_select( mins, selected[:min] ),
++      :style => 'min-width: 10px;max-width: 50px;'
++    )
++  end
++
+   def project_tree_options_for_select(projects, options = {})
+     s = ''.html_safe
+     if blank_text = options[:include_blank]
+diff --git a/app/helpers/queries_helper.rb b/app/helpers/queries_helper.rb
+index 4b71d08..f049652 100644
+--- a/app/helpers/queries_helper.rb
++++ b/app/helpers/queries_helper.rb
+@@ -151,7 +151,17 @@ module QueriesHelper
+         value.to_s(issue) {|other| link_to_issue(other, :subject => false, :tracker => false)}.html_safe,
+         :class => value.css_classes_for(issue))
+     else
+-      format_object(value)
++              case value.class.name
++              when 'Time'
++                if ( column.name == :start_date or column.name == :due_date ) and
++                  ( !issue.project.use_datetime_for_issues or value.strftime('%H%M')=='0000' )
++                  format_date(value)
++                else
++                  format_time(value)
++                end
++              else
++                format_object(value)
++              end
+     end
+   end
+ 
+diff --git a/app/models/issue.rb b/app/models/issue.rb
+index ae3dd10..59b41d0 100644
+--- a/app/models/issue.rb
++++ b/app/models/issue.rb
+@@ -60,6 +60,9 @@ class Issue < ActiveRecord::Base
+   DONE_RATIO_OPTIONS = %w(issue_field issue_status)
+ 
+   attr_reader :current_journal
++  attr_accessor :start_time
++  attr_accessor :due_time
++
+   delegate :notes, :notes=, :private_notes, :private_notes=, :to => :current_journal, :allow_nil => true
+ 
+   validates_presence_of :subject, :project, :tracker
+@@ -70,8 +73,8 @@ class Issue < ActiveRecord::Base
+   validates_length_of :subject, :maximum => 255
+   validates_inclusion_of :done_ratio, :in => 0..100
+   validates :estimated_hours, :numericality => {:greater_than_or_equal_to => 0, :allow_nil => true, :message => :invalid}
+-  validates :start_date, :date => true
+-  validates :due_date, :date => true
++  #validates :start_date, :date => true
++  #validates :due_date, :date => true
+   validate :validate_issue, :validate_required_fields
+   attr_protected :id
+ 
+@@ -105,8 +108,9 @@ class Issue < ActiveRecord::Base
+ 
+   before_validation :clear_disabled_fields
+   before_create :default_assign
++  #Note very well - before_save runs for both updates AND creations (also, before_create is called after before_save)
+   before_save :close_duplicates, :update_done_ratio_from_issue_status,
+-              :force_updated_on_change, :update_closed_on, :set_assigned_to_was
++              :force_updated_on_change, :update_closed_on, :set_assigned_to_was, :add_start_and_due_time
+   after_save {|issue| issue.send :after_project_change if !issue.id_changed? && issue.project_id_changed?}
+   after_save :reschedule_following_issues, :update_nested_set_attributes,
+              :update_parent_attributes, :create_journal
+@@ -409,7 +413,9 @@ class Issue < ActiveRecord::Base
+     'subject',
+     'description',
+     'start_date',
++    'start_time',
+     'due_date',
++    'due_time',    
+     'done_ratio',
+     'estimated_hours',
+     'custom_field_values',
+@@ -530,6 +536,21 @@ class Issue < ActiveRecord::Base
+ 
+     # mass-assignment security bypass
+     assign_attributes attrs, :without_protection => true
++
++    # Helper to make sure that when we load in the time it takes into account that it is supplied localised and must be converted back to utc.
++    def load_localised_time(date, time, time_zone)
++      localised_date = {:year => date.year, :month => date.month, :day => date.day}
++      localised_datetime = date.in_time_zone(time_zone).change({:hour => time['hour'].to_i, :min => time['minute'].to_i})
++      return localised_datetime.change(localised_date).utc
++    end
++
++    if (start_time = attrs.delete('start_time')) && safe_attribute?('start_time') && self.start_date.is_a?(Time)
++      self.start_date = load_localised_time(self.start_date, start_time, user.time_zone)
++    end
++
++    if (due_time = attrs.delete('due_time')) && safe_attribute?('due_time') && self.due_date.is_a?(Time)
++      self.due_date = load_localised_time(self.due_date, due_time, user.time_zone)
++    end
+   end
+ 
+   def disabled_core_fields
+@@ -1611,6 +1632,33 @@ class Issue < ActiveRecord::Base
+     end
+   end
+ 
++  # Callback on start and due time
++  def add_start_and_due_time
++    return if not project.use_datetime_for_issues
++
++    # Not sure if this is a hack or not, but it works :)
++    time_zone = User.current.time_zone
++    system_time_zone = Time.zone
++    if time_zone
++      Time.zone = time_zone
++    end
++
++    if st=start_time and sd=start_date
++      if st['hour'].to_i >= 0 or st['minute'].to_i >= 0
++        self.start_date = Time.zone.parse( "#{sd.year}.#{sd.month}.#{sd.day} #{st['hour']}:#{st['minute']}:00" ).utc # Parse in as local but save as UTC
++      end
++    end
++
++    if dt=due_time and dd=due_date
++      if dt['hour'].to_i >= 0 or dt['minute'].to_i >= 0
++        self.due_date = Time.zone.parse( "#{dd.year}.#{dd.month}.#{dd.day} #{dt['hour']}:#{dt['minute']}:00").utc # Parse in as local but save as UTC
++      end
++    end
++
++    # Since we fudged the timezone to get the values parsing in okay, let's reset it to the system timezone.
++    Time.zone = system_time_zone
++  end
++
+   # Default assignment based on category
+   def default_assign
+     if assigned_to.nil? && category && category.assigned_to
+diff --git a/app/models/project.rb b/app/models/project.rb
+index 197f45e..1dff673 100644
+--- a/app/models/project.rb
++++ b/app/models/project.rb
+@@ -578,23 +578,23 @@ class Project < ActiveRecord::Base
+   # The earliest start date of a project, based on it's issues and versions
+   def start_date
+     @start_date ||= [
+-     issues.minimum('start_date'),
++     issues.minimum('start_date').nil? ? nil : issues.minimum('start_date').to_date,
+      shared_versions.minimum('effective_date'),
+-     Issue.fixed_version(shared_versions).minimum('start_date')
++     Issue.fixed_version(shared_versions).minimum('start_date').nil? ? nil : Issue.fixed_version(shared_versions).minimum('start_date').to_date
+     ].compact.min
+   end
+ 
+   # The latest due date of an issue or version
+   def due_date
+     @due_date ||= [
+-     issues.maximum('due_date'),
++     issues.maximum('due_date').nil? ? nil : issues.maximum('due_date').to_date,
+      shared_versions.maximum('effective_date'),
+-     Issue.fixed_version(shared_versions).maximum('due_date')
++     Issue.fixed_version(shared_versions).maximum('due_date').nil? ? nil : Issue.fixed_version(shared_versions).maximum('due_date').to_date
+     ].compact.max
+   end
+ 
+   def overdue?
+-    active? && !due_date.nil? && (due_date < Date.today)
++    active? && !due_date.nil? && (due_date < DateTime.now)
+   end
+ 
+   # Returns the percent completed for this project, based on the
+@@ -686,6 +686,7 @@ class Project < ActiveRecord::Base
+     'description',
+     'homepage',
+     'is_public',
++    'use_datetime_for_issues',
+     'identifier',
+     'custom_field_values',
+     'custom_fields',
+diff --git a/app/models/version.rb b/app/models/version.rb
+index cb28426..9b0ffa8 100644
+--- a/app/models/version.rb
++++ b/app/models/version.rb
+@@ -111,7 +111,7 @@ class Version < ActiveRecord::Base
+     if completed_percent == 100
+       return false
+     elsif due_date && start_date
+-      done_date = start_date + ((due_date - start_date+1)* completed_percent/100).floor
++      done_date = start_date.to_date + ((due_date.to_date - start_date.to_date + 1) * completed_percent/100).floor
+       return done_date <= Date.today
+     else
+       false # No issues so it's not late
+diff --git a/app/views/issues/_attributes.html.erb b/app/views/issues/_attributes.html.erb
+index 07b863c..c385d3e 100644
+--- a/app/views/issues/_attributes.html.erb
++++ b/app/views/issues/_attributes.html.erb
+@@ -48,14 +48,14 @@
+ 
+ <% if @issue.safe_attribute? 'start_date' %>
+ <p id="start_date_area">
+-  <%= f.text_field(:start_date, :size => 10, :required => @issue.required_attribute?('start_date')) %>
++  <%= f.text_field(:start_date, :value => (@issue.start_date ? localise_date(@issue.start_date).strftime('%Y-%m-%d') : ''), :size => 10, :required => @issue.required_attribute?('start_date')) %>
+   <%= calendar_for('issue_start_date') %>
+ </p>
+ <% end %>
+ 
+ <% if @issue.safe_attribute? 'due_date' %>
+ <p id="due_date_area">
+-  <%= f.text_field(:due_date, :size => 10, :required => @issue.required_attribute?('due_date')) %>
++  <%= f.text_field(:due_date, :value => (@issue.due_date ? localise_date(@issue.due_date).strftime('%Y-%m-%d') : ''), :size => 10, :required => @issue.required_attribute?('due_date')) %>
+   <%= calendar_for('issue_due_date') %>
+ </p>
+ <% end %>
+diff --git a/app/views/issues/show.html.erb b/app/views/issues/show.html.erb
+index 70a7fe1..f5e6b58 100644
+--- a/app/views/issues/show.html.erb
++++ b/app/views/issues/show.html.erb
+@@ -49,10 +49,10 @@
+   end
+ 
+   unless @issue.disabled_core_fields.include?('start_date')
+-    rows.right l(:field_start_date), format_date(@issue.start_date), :class => 'start-date'
++    rows.right l(:field_start_date), (@project.use_datetime_for_issues ? format_time(@issue.start_date) : format_date(@issue.start_date)), :class => 'start-date'
+   end
+   unless @issue.disabled_core_fields.include?('due_date')
+-    rows.right l(:field_due_date), format_date(@issue.due_date), :class => 'due-date'
++    rows.right l(:field_due_date), (@project.use_datetime_for_issues ? format_time(@issue.due_date) : format_date(@issue.due_date)), :class => 'due-date'
+   end
+   unless @issue.disabled_core_fields.include?('done_ratio')
+     rows.right l(:field_done_ratio), progress_bar(@issue.done_ratio, :legend => "#{@issue.done_ratio}%"), :class => 'progress'
+diff --git a/app/views/projects/_form.html.erb b/app/views/projects/_form.html.erb
+index b75ce82..2adc10e 100644
+--- a/app/views/projects/_form.html.erb
++++ b/app/views/projects/_form.html.erb
+@@ -11,6 +11,7 @@
+ <% end %></p>
+ <p><%= f.text_field :homepage, :size => 60 %></p>
+ <p><%= f.check_box :is_public %></p>
++<p><%= f.check_box :use_datetime_for_issues %></p>
+ 
+ <% unless @project.allowed_parents.compact.empty? %>
+     <p><%= label(:project, :parent_id, l(:field_parent)) %><%= parent_project_select_tag(@project) %></p>
+diff --git a/config/locales/cs.yml b/config/locales/cs.yml
+index a888e89..291af78 100644
+--- a/config/locales/cs.yml
++++ b/config/locales/cs.yml
+@@ -313,7 +313,7 @@ cs:
+   field_assigned_to_role: Role přiřaditele
+   field_text: Textové pole
+   field_visible: Viditelný
+-
++  field_use_datetime_for_issues: Použít u tiketů také čas
+   setting_app_title: Název aplikace
+   setting_app_subtitle: Podtitulek aplikace
+   setting_welcome_text: Uvítací text
+diff --git a/config/locales/en-GB.yml b/config/locales/en-GB.yml
+index 2d1e86a..7199a2c 100644
+--- a/config/locales/en-GB.yml
++++ b/config/locales/en-GB.yml
+@@ -313,6 +313,7 @@ en-GB:
+   field_assigned_to_role: "Assignee's role"
+   field_text: Text field
+   field_visible: Visible
++  field_use_datetime_for_issues: Use time in tickets too
+   field_warn_on_leaving_unsaved: "Warn me when leaving a page with unsaved text"
+ 
+   setting_app_title: Application title
+diff --git a/config/locales/en.yml b/config/locales/en.yml
+index 7d98034..6b74168 100644
+--- a/config/locales/en.yml
++++ b/config/locales/en.yml
+@@ -327,6 +327,7 @@ en:
+   field_assigned_to_role: "Assignee's role"
+   field_text: Text field
+   field_visible: Visible
++  field_use_datetime_for_issues: Use time in tickets too
+   field_warn_on_leaving_unsaved: "Warn me when leaving a page with unsaved text"
+   field_issues_visibility: Issues visibility
+   field_is_private: Private
+diff --git a/config/locales/es.yml b/config/locales/es.yml
+index b62e066..e645de1 100644
+--- a/config/locales/es.yml
++++ b/config/locales/es.yml
+@@ -1104,6 +1104,7 @@ es:
+   button_hide: Ocultar
+   setting_non_working_week_days: Días no laborables
+   label_in_the_next_days: en los próximos
++  field_use_datetime_for_issues: Usar hora en prog peticiones
+   label_in_the_past_days: en los anteriores
+   label_attribute_of_user: "%{name} del usuario"
+   text_turning_multiple_off: Si desactiva los valores múltiples, éstos serán eliminados para dejar un único valor por elemento.
+diff --git a/lib/redmine/helpers/calendar.rb b/lib/redmine/helpers/calendar.rb
+index 0e21097..0b27da7 100644
+--- a/lib/redmine/helpers/calendar.rb
++++ b/lib/redmine/helpers/calendar.rb
+@@ -48,8 +48,8 @@ module Redmine
+       # Sets calendar events
+       def events=(events)
+         @events = events
+-        @ending_events_by_days = @events.group_by {|event| event.due_date}
+-        @starting_events_by_days = @events.group_by {|event| event.start_date}
++        @ending_events_by_days = @events.group_by {|event| (event.due_date.is_a?(Date) || event.due_date.nil? ? event.due_date : event.due_date.to_date) }
++        @starting_events_by_days = @events.group_by {|event| (event.start_date.is_a?(Date) || event.start_date.nil?  ? event.start_date : event.start_date.to_date) }
+       end
+ 
+       # Returns events for the given day
+diff --git a/lib/redmine/helpers/gantt.rb b/lib/redmine/helpers/gantt.rb
+index af78d9e..df66393 100644
+--- a/lib/redmine/helpers/gantt.rb
++++ b/lib/redmine/helpers/gantt.rb
+@@ -568,6 +568,9 @@ module Redmine
+       private
+ 
+       def coordinates(start_date, end_date, progress, zoom=nil)
++        start_date = start_date.to_date if not start_date.nil?
++        end_date = end_date.to_date if not end_date.nil?
++
+         zoom ||= @zoom
+         coords = {}
+         if start_date && end_date && start_date < self.date_to && end_date > self.date_from
+@@ -612,7 +615,7 @@ module Redmine
+       end
+ 
+       def calc_progress_date(start_date, end_date, progress)
+-        start_date + (end_date - start_date + 1) * (progress / 100.0)
++        start_date.to_date + (end_date.to_date - start_date.to_date + 1) * (progress / 100.0)
+       end
+ 
+       def self.sort_issues!(issues)
+diff --git a/lib/redmine/i18n.rb b/lib/redmine/i18n.rb
+index 6f0c1ff..4ce5f93 100644
+--- a/lib/redmine/i18n.rb
++++ b/lib/redmine/i18n.rb
+@@ -64,6 +64,14 @@ module Redmine
+       ll(lang, *args) 
+     end
+ 
++    def localise_date(date)
++      return if date.nil?
++
++      zone = User.current.time_zone
++      local = zone ? date.in_time_zone(zone) : date
++      return local
++    end
++
+     def format_date(date)
+       return nil unless date
+       options = {}
+diff --git a/lib/redmine/utils.rb b/lib/redmine/utils.rb
+index 85d3a4b..eab2332 100644
+--- a/lib/redmine/utils.rb
++++ b/lib/redmine/utils.rb
+@@ -81,7 +81,7 @@ module Redmine
+           weeks = days / 7
+           result = weeks * (7 - non_working_week_days.size)
+           days_left = days - weeks * 7
+-          start_cwday = from.cwday
++          start_cwday = from.to_date.cwday
+           days_left.times do |i|
+             unless non_working_week_days.include?(((start_cwday + i - 1) % 7) + 1)
+               result += 1
+@@ -99,7 +99,7 @@ module Redmine
+           weeks = working_days / (7 - non_working_week_days.size)
+           result = weeks * 7
+           days_left = working_days - weeks * (7 - non_working_week_days.size)
+-          cwday = date.cwday
++          cwday = date.to_date.cwday
+           while days_left > 0
+             cwday += 1
+             unless non_working_week_days.include?(((cwday - 1) % 7) + 1)
+@@ -115,7 +115,7 @@ module Redmine
+ 
+       # Returns the date of the first day on or after the given date that is a working day
+       def next_working_date(date)
+-        cwday = date.cwday
++        cwday = date.to_date.cwday
+         days = 0
+         while non_working_week_days.include?(((cwday + days - 1) % 7) + 1)
+           days += 1
+
+diff --git a/test/functional/issues_controller_test.rb b/test/functional/issues_controller_test.rb
+index 3c687c6..512b1cd 100644
+--- a/test/functional/issues_controller_test.rb
++++ b/test/functional/issues_controller_test.rb
+@@ -1845,7 +1845,7 @@ class IssuesControllerTest < ActionController::TestCase
+       assert_response :success
+       assert_template 'new'
+       assert_select 'input[name=?]', 'issue[start_date]'
+-      assert_select 'input[name=?][value]', 'issue[start_date]', 0
++      assert_select 'input[name=?][value]', 'issue[start_date]', 1
+     end
+   end
+ 
+@@ -2064,7 +2064,7 @@ class IssuesControllerTest < ActionController::TestCase
+     assert_equal 2, issue.author_id
+     assert_equal 3, issue.tracker_id
+     assert_equal 2, issue.status_id
+-    assert_equal Date.parse('2010-11-07'), issue.start_date
++    assert_equal DateTime.parse('2010-11-07'), issue.start_date
+     assert_nil issue.estimated_hours
+     v = issue.custom_values.where(:custom_field_id => 2).first
+     assert_not_nil v
+@@ -2131,7 +2131,7 @@ class IssuesControllerTest < ActionController::TestCase
+                            :id => Issue.last.id
+       issue = Issue.find_by_subject('This is the test_new issue')
+       assert_not_nil issue
+-      assert_equal Date.today, issue.start_date
++      assert_equal Date.today, issue.start_date.to_date
+     end
+   end
+ 
+@@ -2306,7 +2306,7 @@ class IssuesControllerTest < ActionController::TestCase
+     end
+ 
+     issue = Issue.order('id DESC').first
+-    assert_equal Date.parse('2012-07-14'), issue.start_date
++    assert_equal DateTime.parse('2012-07-14'), issue.start_date
+     assert_nil issue.due_date
+     assert_equal 'value1', issue.custom_field_value(cf1)
+     assert_nil issue.custom_field_value(cf2)
+@@ -4291,8 +4291,8 @@ class IssuesControllerTest < ActionController::TestCase
+       assert_equal 2, issue.project_id, "Project is incorrect"
+       assert_equal 2, issue.assigned_to_id, "Assigned to is incorrect"
+       assert_equal 1, issue.status_id, "Status is incorrect"
+-      assert_equal '2009-12-01', issue.start_date.to_s, "Start date is incorrect"
+-      assert_equal '2009-12-31', issue.due_date.to_s, "Due date is incorrect"
++      assert_equal '2009-12-01 00:00:00 UTC', issue.start_date.to_s, "Start date is incorrect"
++      assert_equal '2009-12-31 00:00:00 UTC', issue.due_date.to_s, "Due date is incorrect"
+     end
+   end
+ 
