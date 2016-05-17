@@ -1,0 +1,19 @@
+<p>
+<h4> Please configure the due date setting depending on each priority</h4>
+<%  @priorities = IssuePriority.active.order('position') %>
+<table>
+  <tbody>
+  <% @priorities.each do |pr| %>
+      <tr>
+        <td>
+          <%= pr.name %>
+        </td>
+        <td>
+          <%= number_field_tag "settings[#{pr.id}]", @settings["#{pr.id}"] %>
+        </td>
+      </tr>
+  <% end %>
+  </tbody>
+</table>
+
+</p>
